@@ -205,6 +205,20 @@ fn is_hidden(e: &DirEntry) -> bool {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
+    // ── Prebuilt-libs fast path ──
+    // When LLAMA_CPP_PREBUILT_LIB_DIR is set, the consumer has extracted
+    // a prebuilt static-lib bundle (produced by
+    // github.com/EonsofStupid/llama-cpp-prebuilt and fetched by
+    // `cargo xtask fetch-llama-cpp` in the DevPulse workspace). Skip the
+    // in-tree cmake build entirely — bindgen against the prebuilt
+    // headers, compile the C++ wrappers against the prebuilt llama.cpp/
+    // mirror, emit link instructions for the prebuilt .lib files, and
+    // return before the cmake path starts.
+    if env::var("LLAMA_CPP_PREBUILT_LIB_DIR").is_ok() {
+        run_prebuilt_fast_path();
+        return;
+    }
+
     let (target_os, target_triple) =
         parse_target_os().unwrap_or_else(|t| panic!("Failed to parse target os {t}"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -1126,5 +1140,293 @@ fn main() {
                 std::fs::hard_link(asset.clone(), dst).unwrap();
             }
         }
+    }
+}
+
+/// Prebuilt-libs fast path. Active when `LLAMA_CPP_PREBUILT_LIB_DIR` is set.
+///
+/// Skips the in-tree cmake build of llama.cpp. Bindgen runs against the
+/// prebuilt headers, the C++ FFI wrappers (`wrapper_common.cpp`,
+/// `wrapper_oai.cpp`) are compiled against the prebuilt `llama.cpp/`
+/// source-tree mirror, and link instructions point at the prebuilt
+/// `.lib` files.
+///
+/// **Required layout** of `LLAMA_CPP_PREBUILT_LIB_DIR`:
+///
+/// ```text
+/// <prebuilt>/
+///   lib/                          # llama.lib, ggml.lib, ggml-base.lib,
+///                                 # ggml-cpu.lib, ggml-vulkan.lib OR
+///                                 # ggml-cuda.lib, common.lib
+///   llama.cpp/
+///     include/llama.h
+///     ggml/include/{ggml,gguf,...}.h
+///     common/{chat,json-schema-to-grammar,...}.h,*.hpp  (recursive)
+///     vendor/nlohmann/json.hpp
+/// ```
+///
+/// The `llama.cpp/` mirror exists so `wrapper.h`'s quoted include
+/// `"llama.cpp/include/llama.h"` (and similar lines in the .cpp files)
+/// resolves via `-I<prebuilt>` falling through to
+/// `<prebuilt>/llama.cpp/include/llama.h`. No source-level patches to
+/// the wrappers are required.
+///
+/// Produced by [`EonsofStupid/llama-cpp-prebuilt`](https://github.com/EonsofStupid/llama-cpp-prebuilt)
+/// and fetched into `deps/llama-cpp-prebuilt/<target>/` by
+/// `cargo xtask fetch-llama-cpp` in the DevPulse workspace. `apply_env`
+/// in xtask exports `LLAMA_CPP_PREBUILT_LIB_DIR` automatically when the
+/// target subdir exists.
+fn run_prebuilt_fast_path() {
+    println!("cargo:rerun-if-env-changed=LLAMA_CPP_PREBUILT_LIB_DIR");
+
+    let prebuilt = env::var("LLAMA_CPP_PREBUILT_LIB_DIR")
+        .expect("LLAMA_CPP_PREBUILT_LIB_DIR must be set when this function runs");
+    let prebuilt_dir = PathBuf::from(&prebuilt);
+    let lib_dir = prebuilt_dir.join("lib");
+    let llama_cpp = prebuilt_dir.join("llama.cpp");
+
+    // Sanity-check the layout before doing anything that depends on it.
+    let llama_lib_name = if cfg!(target_os = "windows") {
+        "llama.lib"
+    } else {
+        "libllama.a"
+    };
+    let llama_lib = lib_dir.join(llama_lib_name);
+    if !llama_lib.is_file() {
+        panic!(
+            "LLAMA_CPP_PREBUILT_LIB_DIR={prebuilt} but expected file {} not found. \
+             Either the prebuilt fetch is incomplete or the layout drifted from spec.",
+            llama_lib.display()
+        );
+    }
+    let llama_h = llama_cpp.join("include").join("llama.h");
+    if !llama_h.is_file() {
+        panic!(
+            "LLAMA_CPP_PREBUILT_LIB_DIR={prebuilt} but {} not found. The prebuilt zip \
+             must mirror llama.cpp's source-tree under llama.cpp/ (include/, \
+             ggml/include/, common/, vendor/). See \
+             github.com/EonsofStupid/llama-cpp-prebuilt for the staging contract.",
+            llama_h.display()
+        );
+    }
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
+    let target_triple = env::var("TARGET").expect("TARGET env not set");
+    let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS not set");
+    let is_msvc = target_triple.contains("msvc");
+
+    // ── Bindgen against prebuilt headers ──
+    // `wrapper.h` writes `#include "llama.cpp/include/llama.h"` etc. With
+    // `-I<prebuilt_dir>` those quoted includes resolve to
+    // `<prebuilt_dir>/llama.cpp/include/llama.h` — exactly the layout the
+    // prebuilt zip stages.
+    let mut bindings_builder = bindgen::Builder::default()
+        .header("wrapper.h")
+        .clang_arg(format!("-I{}", prebuilt_dir.display()))
+        .clang_arg(format!("-I{}", llama_cpp.join("include").display()))
+        .clang_arg(format!("-I{}", llama_cpp.join("ggml/include").display()))
+        .clang_arg(format!("-I{}", llama_cpp.join("vendor").display()))
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .derive_partialeq(true)
+        .allowlist_function("ggml_.*")
+        .allowlist_type("ggml_.*")
+        .allowlist_function("gguf_.*")
+        .allowlist_type("gguf_.*")
+        .allowlist_function("llama_.*")
+        .allowlist_type("llama_.*")
+        .allowlist_function("llama_rs_.*")
+        .allowlist_type("llama_rs_.*")
+        .prepend_enum_name(false);
+
+    if cfg!(feature = "mtmd") {
+        bindings_builder = bindings_builder
+            .header("wrapper_mtmd.h")
+            .allowlist_function("mtmd_.*")
+            .allowlist_type("mtmd_.*");
+    }
+
+    // MSVC header discovery — same trick the fallback path uses to feed
+    // libclang the right system include paths.
+    if target_os == "windows" && is_msvc {
+        let dummy_c = out_dir.join("dummy.c");
+        std::fs::write(&dummy_c, "int main() { return 0; }")
+            .expect("write dummy.c for MSVC include discovery");
+        let mut probe = cc::Build::new();
+        probe.file(&dummy_c);
+        let compiler = probe
+            .try_get_compiler()
+            .expect("cc::Build::try_get_compiler failed under MSVC fast-path");
+        let env_include = compiler
+            .env()
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("INCLUDE"))
+            .map(|(_, v)| v.clone());
+        if let Some(include_paths) = env_include {
+            for path in include_paths
+                .to_string_lossy()
+                .split(';')
+                .filter(|s| !s.is_empty())
+            {
+                bindings_builder = bindings_builder
+                    .clang_arg("-isystem")
+                    .clang_arg(path);
+            }
+        }
+        bindings_builder = bindings_builder
+            .clang_arg(format!("--target={target_triple}"))
+            .clang_arg("-fms-compatibility")
+            .clang_arg("-fms-extensions");
+    }
+
+    let bindings = bindings_builder
+        .generate()
+        .expect("Failed to generate bindings against prebuilt headers");
+    bindings
+        .write_to_file(out_dir.join("bindings.rs"))
+        .expect("Failed to write bindings.rs");
+
+    println!("cargo:rerun-if-changed=wrapper.h");
+    println!("cargo:rerun-if-changed=wrapper_common.h");
+    println!("cargo:rerun-if-changed=wrapper_common.cpp");
+    println!("cargo:rerun-if-changed=wrapper_oai.h");
+    println!("cargo:rerun-if-changed=wrapper_oai.cpp");
+    println!("cargo:rerun-if-changed=wrapper_utils.h");
+    println!("cargo:rerun-if-changed=wrapper_mtmd.h");
+
+    // ── Compile the C++ FFI wrappers against the prebuilt mirror ──
+    let mut wrapper = cc::Build::new();
+    wrapper
+        .cpp(true)
+        .file("wrapper_common.cpp")
+        .file("wrapper_oai.cpp")
+        .include(&prebuilt_dir)
+        .include(llama_cpp.join("include"))
+        .include(llama_cpp.join("ggml/include"))
+        .include(llama_cpp.join("common"))
+        .include(llama_cpp.join("vendor"))
+        .flag_if_supported("-std=c++17")
+        .pic(true);
+    if target_os == "windows" && is_msvc {
+        wrapper.flag("/std:c++17");
+    }
+    wrapper.compile("llama_cpp_sys_2_common_wrapper");
+
+    // ── Emit link instructions for the prebuilt static libs ──
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+
+    let mut linked_any = false;
+    for entry in std::fs::read_dir(&lib_dir).expect("read prebuilt lib_dir") {
+        let entry = entry.expect("read_dir entry");
+        let path = entry.path();
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        if !matches!(ext, "lib" | "a") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let name = stem.strip_prefix("lib").unwrap_or(stem);
+        println!("cargo:rustc-link-lib=static={name}");
+        linked_any = true;
+    }
+    assert!(
+        linked_any,
+        "no .lib/.a files found under {}",
+        lib_dir.display()
+    );
+
+    // ── Platform system libs the prebuilt static libs reference ──
+    // The prebuilt zip carries llama.cpp's own static libs; OS / system
+    // libs (user32, ws2_32, vulkan-1, cudart) are linked dynamically and
+    // must be named separately.
+    //
+    // Backend detection reads PROVENANCE.json from the prebuilt — it's
+    // the canonical signal of which backend was actually compiled in.
+    // (Earlier heuristics — checking for `ggml-vulkan.h` / `ggml-cuda.h`
+    // header presence — gave false positives because upstream cmake
+    // exports the header tree regardless of which backends were
+    // enabled. The `.lib` file isn't reliable either: upstream's
+    // static build folds backend symbols into `ggml.lib`, so there's
+    // no separate `ggml-vulkan.lib` even when vulkan is enabled.)
+    let provenance_path = prebuilt_dir.join("PROVENANCE.json");
+    let prebuilt_backend = std::fs::read_to_string(&provenance_path)
+        .ok()
+        .and_then(|s| {
+            // Parse a tiny field by hand — avoids pulling serde_json
+            // into the build script just for this one read.
+            s.split("\"backend\"")
+                .nth(1)
+                .and_then(|after| after.split('"').nth(1))
+                .map(|b| b.to_string())
+        })
+        .unwrap_or_default();
+    let has_vulkan = prebuilt_backend == "vulkan";
+    let has_cuda = prebuilt_backend == "cuda";
+
+    if target_os == "windows" && is_msvc {
+        println!("cargo:rustc-link-lib=dylib=user32");
+        println!("cargo:rustc-link-lib=dylib=advapi32");
+        println!("cargo:rustc-link-lib=dylib=ws2_32");
+
+        if has_vulkan {
+            // The prebuilt static libs reference vulkan-1.lib's import
+            // stubs; the import lib itself lives under the Vulkan SDK
+            // install. Search path comes from the operator's VULKAN_SDK
+            // env (set by xtask apply_env from [build.deps.vulkan]) or
+            // the conventional install root as a fallback.
+            println!("cargo:rerun-if-env-changed=VULKAN_SDK");
+            if let Ok(sdk) = env::var("VULKAN_SDK") {
+                println!("cargo:rustc-link-search=native={}/Lib", sdk);
+            } else {
+                eprintln!(
+                    "warning: VULKAN_SDK env not set under prebuilt fast-path; \
+                     vulkan-1.lib may not be findable. Install Vulkan SDK and \
+                     export VULKAN_SDK, or rely on xtask apply_env."
+                );
+            }
+            println!("cargo:rustc-link-lib=dylib=vulkan-1");
+        }
+        if has_cuda {
+            // Same shape for CUDA — cudart.lib lives under the CUDA Toolkit
+            // install. xtask apply_env sets CUDA_PATH from [build.deps.cuda].
+            println!("cargo:rerun-if-env-changed=CUDA_PATH");
+            if let Ok(cuda) = env::var("CUDA_PATH") {
+                println!("cargo:rustc-link-search=native={}/lib/x64", cuda);
+            } else {
+                eprintln!(
+                    "warning: CUDA_PATH env not set under prebuilt fast-path; \
+                     cudart.lib may not be findable. Install CUDA Toolkit and \
+                     export CUDA_PATH, or rely on xtask apply_env."
+                );
+            }
+            println!("cargo:rustc-link-lib=dylib=cudart");
+            println!("cargo:rustc-link-lib=dylib=cublas");
+            println!("cargo:rustc-link-lib=dylib=cublasLt");
+        }
+
+        // Match the fallback path's CRT choice.
+        let crt_static = env::var("CARGO_CFG_TARGET_FEATURE")
+            .unwrap_or_default()
+            .contains("crt-static");
+        if cfg!(debug_assertions) {
+            if crt_static {
+                println!("cargo:rustc-link-lib=libcmtd");
+            } else {
+                println!("cargo:rustc-link-lib=dylib=msvcrtd");
+            }
+        }
+    } else if target_os == "linux" {
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+        if has_vulkan {
+            println!("cargo:rustc-link-lib=dylib=vulkan");
+        }
+    } else if target_os == "macos" {
+        println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=framework=Metal");
+        println!("cargo:rustc-link-lib=framework=MetalKit");
+        println!("cargo:rustc-link-lib=framework=Accelerate");
+        println!("cargo:rustc-link-lib=c++");
     }
 }

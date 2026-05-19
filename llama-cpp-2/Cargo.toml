@@ -55,23 +55,10 @@ workspace = true
 [package.metadata.docs.rs]
 features = ["sampler"]
 
-[[example]]
-name = "usage"
-path = "../examples/usage.rs"
-
-[[example]]
-name = "tools"
-path = "../examples/tools.rs"
-
-[[example]]
-name = "tools_reasoning"
-path = "../examples/tools_reasoning.rs"
-
-[[example]]
-name = "openai_stream"
-path = "../examples/openai_stream.rs"
-
-[[example]]
-name = "llguidance"
-path = "../examples/llguidance.rs"
-required-features = ["llguidance"]
+# Upstream `[[example]]` entries removed — DevPulse vendors this fork
+# strictly as a library dependency and never builds the examples. The
+# upstream examples still reference the deprecated `Special` enum and
+# `token_to_(str|bytes){,_with_size}` / `tokens_to_str` functions that
+# were dropped from `src/model.rs` to keep the workspace warning-clean.
+# Restore the entries if you ever want to compile the examples (and
+# revive the deprecated API at the same time).
