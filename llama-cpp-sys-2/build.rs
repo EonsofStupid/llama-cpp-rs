@@ -206,15 +206,24 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
     // ── Prebuilt-libs fast path ──
-    // When LLAMA_CPP_PREBUILT_LIB_DIR is set, the consumer has extracted
-    // a prebuilt static-lib bundle (produced by
+    // When LLAMA_CPP_PREBUILT_LIB_DIR is set to a non-empty value, the
+    // consumer has extracted a prebuilt static-lib bundle (produced by
     // github.com/EonsofStupid/llama-cpp-prebuilt and fetched by
     // `cargo xtask fetch-llama-cpp` in the DevPulse workspace). Skip the
     // in-tree cmake build entirely — bindgen against the prebuilt
     // headers, compile the C++ wrappers against the prebuilt llama.cpp/
     // mirror, emit link instructions for the prebuilt .lib files, and
     // return before the cmake path starts.
-    if env::var("LLAMA_CPP_PREBUILT_LIB_DIR").is_ok() {
+    //
+    // Empty-string treated as not-set so CI runners that explicitly
+    // unset this Windows-only path (via `echo VAR= >> $GITHUB_ENV`)
+    // fall through to the from-source build cleanly.
+    println!("cargo:rerun-if-env-changed=LLAMA_CPP_PREBUILT_LIB_DIR");
+    if env::var("LLAMA_CPP_PREBUILT_LIB_DIR")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .is_some()
+    {
         run_prebuilt_fast_path();
         return;
     }
